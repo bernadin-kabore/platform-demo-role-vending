@@ -1,0 +1,28 @@
+# roles/ is deliberately NOT listed here.
+#
+# That does not mean role requests merge themselves — branch protection still
+# requires a human approval, and nothing in this repository has a ruleset
+# bypass. It means the approver does not have to be the platform team. A file
+# in roles/ can only select bundles from the catalogue, and every role it
+# produces is capped by a permissions boundary this repository cannot change,
+# so approving one is a judgement about whether the application should exist,
+# not an IAM review. Anyone on the platform team can give it in seconds, with
+# the plan comment in front of them.
+#
+# Everything below can widen what a vended role may do, so it needs the people
+# who own that decision.
+
+# Raw IAM statements. The escape hatch exists because the catalogue will never
+# cover everything; it is a separate directory rather than a field inside the
+# requesting team's own file precisely so that this line can gate it.
+/exceptions/ @bernadin-kabore
+
+# main.tf holds the pinned module ref. Moving that pin changes what
+# self-service is able to ask for, for every role vended here.
+/main.tf @bernadin-kabore
+/providers.tf @bernadin-kabore
+/backend.tf @bernadin-kabore
+/variables.tf @bernadin-kabore
+
+# The pipeline that holds the credential able to create IAM roles.
+/.github/ @bernadin-kabore

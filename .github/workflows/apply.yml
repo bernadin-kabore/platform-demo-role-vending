@@ -1,0 +1,118 @@
+name: apply
+
+# Runs after a human merges. Nothing in this repository merges itself.
+#
+# The role assumed here can create IAM roles, which makes it the most
+# privileged identity on the platform. What keeps that safe is not this
+# workflow being careful: the policy on the role pins iam:PermissionsBoundary
+# to one exact ARN, so a CreateRole call that omits the platform boundary is
+# refused by IAM. The boundary itself is owned by envs/dev in the Terraform
+# repository, which this pipeline has no permission to change.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "roles/**"
+      - "exceptions/**"
+      - "*.tf"
+      - ".github/workflows/apply.yml"
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  # Never two applies against one state. Not cancel-in-progress: interrupting
+  # an apply mid-write is how state ends up describing infrastructure that does
+  # not exist.
+  group: apply
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: role-vending
+    steps:
+      # Full history: the dispatch step diffs this push against its
+      # predecessor to find newly added role files, which a shallow clone
+      # cannot resolve.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.7
+          terraform_wrapper: false
+
+      - name: Assume the vending role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Init
+        run: terraform init -backend-config=backend.hcl -input=false
+
+      # Writing the ARN into the consuming repository, and dispatching its
+      # first build, both act on a repository this one does not own. That needs
+      # a token with Variables and Contents write on the vended repositories --
+      # a GitHub App installation token or a fine-grained PAT, never the
+      # workflow's own GITHUB_TOKEN, which is scoped to this repository alone.
+      - name: Apply
+        env:
+          GITHUB_TOKEN: ${{ secrets.PLATFORM_GITHUB_TOKEN }}
+        run: terraform apply -input=false -auto-approve
+
+      # Kick the first build for applications vended by THIS push, and only
+      # those.
+      #
+      # A scaffolded repository fires its pipeline the moment it is created,
+      # which is before this apply has run, so before the role it needs exists.
+      # That first run skips the build rather than failing it; this is what
+      # tells it to try again now that AWS_CI_ROLE_ARN is set. Without it the
+      # developer is left looking at a skipped pipeline having to know to
+      # re-run it.
+      #
+      # Scoped to role files ADDED in this push, not to everything in state:
+      # re-running an apply, or merging an unrelated change, must not rebuild
+      # every application on the platform.
+      - name: Kick the first build for newly vended applications
+        env:
+          GH_TOKEN: ${{ secrets.PLATFORM_GITHUB_TOKEN }}
+        run: |
+          added=$(git diff --name-only --diff-filter=A \
+            "${{ github.event.before }}" "${{ github.sha }}" -- roles/ || true)
+
+          if [ -z "$added" ]; then
+            echo "No new role files in this push; nothing to dispatch."
+            exit 0
+          fi
+
+          repositories=$(terraform output -json vended_repositories)
+
+          for path in $added; do
+            key=$(basename "$path" .yaml)
+            repo=$(echo "$repositories" | jq -r --arg k "$key" '.[$k] // empty')
+
+            if [ -z "$repo" ]; then
+              echo "::warning::No vended repository for $key; skipping dispatch."
+              continue
+            fi
+
+            echo "Dispatching first build to $repo"
+            gh api "repos/$repo/dispatches" \
+              -f event_type=platform-role-vended \
+              || echo "::warning::Dispatch to $repo failed; its pipeline can be re-run by hand."
+          done
+
+      - name: Summarise what is now vended
+        if: always()
+        run: |
+          {
+            echo "## Vended roles"
+            echo
+            terraform output -json role_arns \
+              | jq -r 'to_entries[] | "- **\(.key)** — `\(.value)`"'
+          } >> "$GITHUB_STEP_SUMMARY"

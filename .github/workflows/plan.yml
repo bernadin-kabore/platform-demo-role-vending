@@ -1,0 +1,132 @@
+name: plan
+
+# What a reviewer reads before approving.
+#
+# The human approval on a role request was kept deliberately: a permissions
+# boundary caps how bad a mistake can be, but it cannot say whether an
+# application should exist or who owns it, and that judgement is what the
+# approval records. An approval given without seeing the plan is a rubber
+# stamp, so this workflow exists to make the plan the first thing in the
+# conversation rather than something a reviewer has to go and run.
+#
+# It assumes a different, read-only role from the one apply uses. That is not
+# belt and braces: the apply role is trusted from refs/heads/main only, so a
+# pull request build genuinely cannot assume it, and a fork's pull request
+# presents the same OIDC subject as an internal one. The plan role can read
+# everything a refresh touches and write nothing but the state lock.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+concurrency:
+  # One plan per pull request. A superseded plan is noise on the thread and
+  # holds the state lock the next one needs.
+  group: plan-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.14.7
+          terraform_wrapper: false
+
+      - name: Assume the read-only plan role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+
+      - name: Init
+        run: terraform init -backend-config=backend.hcl -input=false
+
+      # No GitHub token here on purpose. Writing the ARN into a consuming
+      # repository is an apply-time action; a pull request must not be able to
+      # touch another repository, so the plan runs with that half switched off.
+      - name: Plan
+        id: plan
+        run: |
+          terraform plan -input=false -no-color \
+            -var publish_role_arn_to_repo=false \
+            -out=tfplan 2>&1 | tee plan.txt
+          echo "exitcode=${PIPESTATUS[0]}" >> "$GITHUB_OUTPUT"
+
+      # The reviewable artifact. granted_statements is the whole point: it
+      # renders what each role may actually do as a flat list, so a reviewer
+      # reads one line per permission instead of diffing rendered IAM JSON.
+      - name: Render what this grants
+        id: grants
+        run: |
+          terraform show -json tfplan \
+            | jq -r '.planned_values.outputs.granted_statements.value // {}
+                     | to_entries[]
+                     | "### \(.key)\n" + (
+                         [.value[] | "- `\(.actions | join("`, `"))`\n  on `\(.resources | join("`, `"))`"]
+                         | join("\n")
+                       )' > grants.md || echo "_No grants in this plan._" > grants.md
+
+      - name: Comment the plan on the pull request
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const grants = fs.readFileSync('grants.md', 'utf8');
+            const plan = fs.readFileSync('plan.txt', 'utf8');
+            // Terraform plans get long; the grant summary is the part a
+            // reviewer actually needs, so it goes first and uncollapsed.
+            const truncated = plan.length > 60000
+              ? plan.slice(0, 60000) + '\n\n... truncated, see the job log ...'
+              : plan;
+            const body = [
+              '## What this pull request grants',
+              '',
+              grants,
+              '',
+              '<details><summary>Full Terraform plan</summary>',
+              '',
+              '```terraform',
+              truncated,
+              '```',
+              '',
+              '</details>',
+            ].join('\n');
+
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            // Update in place rather than adding a comment per push, so the
+            // thread stays readable across revisions.
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.startsWith('## What this pull request grants'));
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Fail if the plan failed
+        if: steps.plan.outputs.exitcode != '0'
+        run: exit 1

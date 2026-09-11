@@ -1,0 +1,12 @@
+aws_region  = "us-east-1"
+name_prefix = "platform-demo"
+
+# Every repository vended for must belong to this owner: publishing the ARN
+# back into the repository goes through one GitHub provider.
+github_org = "YOUR_GITHUB_OWNER"
+
+# Writes each ARN into its repository as the AWS_CI_ROLE_ARN Actions secret.
+# Needs GITHUB_TOKEN in the environment. Set false to run the AWS half alone.
+publish_role_arn_to_repo = true
+
+owner = "YOUR_NAME_OR_TEAM"
